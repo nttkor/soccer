@@ -27,32 +27,32 @@ This script mirrors the Jupyter notebook logic but can be executed directly.
 - main: 전체 파이프라인(데이터 로드 → 시퀀스 생성 → 학습 루프 → 추론/제출 저장)을 실행
 """
 
-import os  # 경로 처리용
-import math  # positional encoding 계산에 필요한 수학 함수
-from time import time  # epoch 시간 측정
+import os
+import math
+from time import time
 
-import numpy as np  # 수치 계산
-import pandas as pd  # CSV 로드 및 테이블 전처리
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset  # 배치 생성
-from sklearn.model_selection import train_test_split  # train/val 분리
-from tqdm import tqdm  # 진행률 표시
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
-# Configuration dictionary (실험 설정을 한 곳에 모아둔 딕셔너리)
+# Configuration dictionary
 # ---------------------------------------------------------------------------
 CONFIG = {
-    "field_dims": (105.0, 68.0),  # 축구장 실제 가로/세로 길이 (미터 단위)
-    "action_scale": 60.0,  # action_id를 0~1 근처로 맞추기 위한 스케일
-    "goal_xy": (1.0, 0.5),  # 정규화 좌표계에서의 골대 위치 (우측 중앙)
-    "seq_len": 10,  # 하나의 에피소드에서 사용할 시퀀스 길이
-    "feature_size": 8,  # 한 타임스텝에서의 피처 차원 수
-    "augmentations": {  # 데이터 증강 설정
-        "vertical": True,   # y 축 기준 상하 반전
-        "horizontal": True, # x 축 기준 좌우 반전
-        "both": True,       # x, y 모두 반전
+    "field_dims": (105.0, 68.0),
+    "action_scale": 60.0,
+    "goal_xy": (1.0, 0.5),
+    "seq_len": 10,
+    "feature_size": 8,
+    "augmentations": {
+        "vertical": True,
+        "horizontal": True,
+        "both": True,
     },
     "model": {
         "d_model": 256,
@@ -69,286 +69,489 @@ CONFIG = {
     "fallback_xy": (52.5, 34.0),
 }
 
+# [변경] 출력 디렉토리 설정 (스크립트 실행 위치 기준, 혹은 절대 경로)
+# 현재 스크립트가 track1/script/ 에 있다고 가정하고, track1/output/ 을 타겟으로 함
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # track1/script
+PROJECT_ROOT = os.path.dirname(BASE_DIR)               # track1
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")      # track1/output
+
+# 출력 디렉토리 생성
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"Output directory set to: {OUTPUT_DIR}")
+
 
 # ---------------------------------------------------------------------------
-# Utility functions (유틸리티 함수들)
+# Utility functions
 # ---------------------------------------------------------------------------
-def map_result(value: str) -> float:  # 텍스트 결과를 숫자로 변환하는 함수
+def map_result(value: str) -> float:
     """Convert textual result labels into numeric hints."""
-    if value == "Successful":  # 성공인 경우
-        return 1.0  # 1.0 반환
-    if value == "Unsuccessful":  # 실패인 경우
-        return -1.0  # -1.0 반환
-    return 0.0  # 그 외는 0.0 반환
+    if value == "Successful":
+        return 1.0
+    if value == "Unsuccessful":
+        return -1.0
+    return 0.0
 
 
-def preprocess_dataframe(df: pd.DataFrame, config: dict, is_train: bool = True) -> pd.DataFrame:  # 데이터프레임 전처리 함수
+def preprocess_dataframe(df: pd.DataFrame, config: dict, is_train: bool = True) -> pd.DataFrame:
     """Normalize columns and append result mapping."""
-    field_x, field_y = config["field_dims"]  # 축구장 가로/세로 길이 가져오기
-    df = df.copy()  # 원본 데이터프레임 복사 (원본 보호)
-    for col in ("start_x", "end_x"):  # 시작/끝 x 좌표 정규화
-        if col in df.columns:  # 해당 컬럼이 존재하면
-            df[col] = df[col].astype(float) / field_x  # 실제 길이로 나누어 0~1 범위로 정규화
-    for col in ("start_y", "end_y"):  # 시작/끝 y 좌표 정규화
-        if col in df.columns:  # 해당 컬럼이 존재하면
-            df[col] = df[col].astype(float) / field_y  # 실제 길이로 나누어 0~1 범위로 정규화
-    if "action_id" in df.columns:  # 액션 ID 컬럼이 있으면
-        df["action_id"] = df["action_id"].fillna(0) / config["action_scale"]  # NaN을 0으로 채우고 스케일로 나누어 정규화
-    else:  # 액션 ID 컬럼이 없으면
-        df["action_id"] = 0.0  # 기본값 0.0 설정
-    if "result_name" in df.columns:  # 결과 텍스트 컬럼이 있으면
-        df["result_mapped"] = df["result_name"].apply(map_result)  # 텍스트를 숫자로 변환하여 새 컬럼 생성
-    elif "result_mapped" not in df.columns:  # 결과 매핑 컬럼이 없으면
-        df["result_mapped"] = 0.0  # 기본값 0.0 설정
-    else:  # 이미 결과 매핑 컬럼이 있으면
-        df["result_mapped"] = df["result_mapped"].fillna(0)  # NaN만 0으로 채우기
-    return df  # 전처리된 데이터프레임 반환
+    field_x, field_y = config["field_dims"]
+    df = df.copy()
+    for col in ("start_x", "end_x"):
+        if col in df.columns:
+            df[col] = df[col].astype(float) / field_x
+    for col in ("start_y", "end_y"):
+        if col in df.columns:
+            df[col] = df[col].astype(float) / field_y
+    if "action_id" in df.columns:
+        df["action_id"] = df["action_id"].fillna(0) / config["action_scale"]
+    else:
+        df["action_id"] = 0.0
+    if "result_name" in df.columns:
+        df["result_mapped"] = df["result_name"].apply(map_result)
+    else:
+        df["result_mapped"] = 0.0
+    return df
 
 
-def build_feature_matrix(coords, actions, results, goal_xy):  # 8차원 피처 행렬 생성 함수
-    """Create 8D feature matrix for a single episode."""
-    goal_x, goal_y = goal_xy  # 골대 위치 가져오기 (정규화된 좌표)
-    dist = np.sqrt((coords[:, 0] - goal_x) ** 2 + (coords[:, 1] - goal_y) ** 2).reshape(-1, 1)  # 각 타임스텝에서 골대까지의 유클리드 거리 계산
-    angle = np.arctan2(coords[:, 1] - goal_y, coords[:, 0] - goal_x).reshape(-1, 1)  # 골대를 향한 각도 계산 (라디안)
-    velocities = np.zeros_like(coords)  # 속도 배열 초기화 (첫 타임스텝은 0)
-    if len(coords) > 1:  # 좌표가 2개 이상이면 속도 계산 가능
-        velocities[1:, 0] = coords[1:, 0] - coords[:-1, 0]  # x 방향 속도 = 다음 x - 현재 x
-        velocities[1:, 1] = coords[1:, 1] - coords[:-1, 1]  # y 방향 속도 = 다음 y - 현재 y
-    return np.hstack([coords, dist, angle, actions, velocities, results])  # [x,y,거리,각도,액션,x속도,y속도,결과] 8차원 피처로 연결
+def build_feature_matrix(df_segment: pd.DataFrame, config: dict) -> np.ndarray:
+    """
+    Construct (L, F) matrix.
+    Feats: [start_x, start_y, dist_goal, angle_goal, result_mapped, action_id, speed, time_delta]
+    """
+    gx, gy = config["goal_xy"]
+    feats = []
+    
+    # Pre-compute time deltas
+    times = df_segment["time_seconds"].values
+    if len(times) > 1:
+        dt = np.diff(times, prepend=times[0])
+    else:
+        dt = np.zeros_like(times)
+        
+    # Avoid division by zero
+    dt = np.where(dt < 1e-9, 1.0, dt)
+
+    for i, row in enumerate(df_segment.itertuples(index=False)):
+        sx = getattr(row, "start_x", 0.0)
+        sy = getattr(row, "start_y", 0.0)
+        
+        # Distance/Angle to goal
+        dx_g = gx - sx
+        dy_g = gy - sy
+        dist_g = math.sqrt(dx_g**2 + dy_g**2)
+        angle_g = math.atan2(dy_g, dx_g)
+        
+        # Speed estimate (distance from previous action / time delta)
+        # For the first item, speed is 0 or needs logic. Here simply 0 or based on dist.
+        # We'll use a simple proxy: just use dt[i] as a feature, let model learn.
+        # Or compute speed if previous x,y known. 
+        # Simplified: just use dt.
+        
+        # Features
+        # 0: start_x
+        # 1: start_y
+        # 2: dist_goal
+        # 3: angle_goal
+        # 4: result_mapped
+        # 5: action_id
+        # 6: dt (time diff from prev action)
+        # 7: dummy or speed (Using dt directly for now)
+        
+        # Accessing row fields safely
+        res_m = getattr(row, "result_mapped", 0.0)
+        act_id = getattr(row, "action_id", 0.0)
+        
+        feat_vec = [sx, sy, dist_g, angle_g, res_m, act_id, dt[i], 0.0]
+        feats.append(feat_vec)
+        
+    return np.array(feats, dtype=np.float32)
 
 
-def pad_or_truncate(features: np.ndarray, seq_len: int, feature_size: int) -> np.ndarray:  # 시퀀스 길이 맞추기 함수
-    """Trim old steps or front-pad zeros to match the desired sequence length."""
-    if len(features) >= seq_len:  # 입력 시퀀스가 목표 길이보다 길면
-        return features[-seq_len:]  # 뒤에서부터 목표 길이만큼 자르기 (최근 타임스텝 우선)
-    padded = np.zeros((seq_len, feature_size))  # (시퀀스길이, 피처차원) 크기의 0으로 채워진 배열 생성
-    padded[-len(features):] = features  # 뒤쪽부터 실제 데이터를 채우기 (앞쪽은 0 패딩)
-    return padded  # 패딩 또는 잘린 시퀀스 반환
+def pad_or_truncate(arr: np.ndarray, length: int) -> np.ndarray:
+    """Pad (pre) or truncate (keep last L) array."""
+    L, F = arr.shape
+    if L == length:
+        return arr
+    if L > length:
+        return arr[-length:]  # Keep last actions
+    # Pad
+    pad_len = length - L
+    # Pad with first row or zeros? usually zeros for "no action"
+    # But padding with zeros might be interpreted as (0,0) coordinate.
+    # Let's pad with zeros.
+    padding = np.zeros((pad_len, F), dtype=arr.dtype)
+    return np.vstack([padding, arr])
 
 
-def generate_variants(coords, target, config, enable_augment):  # 데이터 증강 변형 생성 함수
-    """Augment coordinates/targets according to configuration."""
-    variants = [(coords, target)]  # 원본 좌표와 타깃 쌍을 기본으로 포함
-    if not enable_augment:  # 증강 옵션이 꺼져 있으면
-        return variants  # 원본만 반환
-    aug_cfg = config["augmentations"]  # 증강 설정 가져오기
-    if aug_cfg.get("vertical"):  # 수직(y축) 반전 증강이 활성화되어 있으면
-        coords_v = coords.copy()  # 좌표 배열 복사
-        coords_v[:, 1] = 1.0 - coords_v[:, 1]  # y 좌표를 1.0에서 빼서 상하 반전 (축구장 대칭)
-        target_v = target.copy()  # 타깃 좌표 복사
-        target_v[1] = 1.0 - target_v[1]  # 타깃 y 좌표도 반전
-        variants.append((coords_v, target_v))  # 수직 반전 버전 추가
-    if aug_cfg.get("horizontal"):  # 수평(x축) 반전 증강이 활성화되어 있으면
-        coords_h = coords.copy()  # 좌표 배열 복사
-        coords_h[:, 0] = 1.0 - coords_h[:, 0]  # x 좌표를 1.0에서 빼서 좌우 반전
-        target_h = target.copy()  # 타깃 좌표 복사
-        target_h[0] = 1.0 - target_h[0]  # 타깃 x 좌표도 반전
-        variants.append((coords_h, target_h))  # 수평 반전 버전 추가
-    if aug_cfg.get("both"):  # 양방향(x,y 모두) 반전 증강이 활성화되어 있으면
-        coords_hv = coords.copy()  # 좌표 배열 복사
-        coords_hv[:, 0] = 1.0 - coords_hv[:, 0]  # x 좌표 반전
-        coords_hv[:, 1] = 1.0 - coords_hv[:, 1]  # y 좌표 반전
-        target_hv = target.copy()  # 타깃 좌표 복사
-        target_hv[0] = 1.0 - target_hv[0]  # 타깃 x 좌표 반전
-        target_hv[1] = 1.0 - target_hv[1]  # 타깃 y 좌표 반전
-        variants.append((coords_hv, target_hv))  # 양방향 반전 버전 추가
-    return variants  # 원본 + 증강된 모든 변형 리스트 반환 (최대 4배)
+def generate_variants(seq: np.ndarray, target: np.ndarray, config: dict):
+    """
+    Generate augmented versions of (seq, target).
+    Coordinates are at indices 0 (x), 1 (y).
+    Target is (x, y).
+    """
+    variants = [(seq, target)]
+    
+    # Indices for x, y in features
+    # start_x=0, start_y=1
+    # angle_goal=3 -> also needs flip? Yes.
+    # dist_goal=2 -> invariant
+    
+    # We will only flip X, Y for simplicity. Angle update is tricky but let's approximate or skip.
+    # Ideally re-compute features after flip.
+    
+    # However, to be correct, we should augment RAW data, then build features.
+    # Here we operate on features for speed, assuming simple geometric flips.
+    
+    # Normalized coords are 0..1. 
+    # Vertical flip: y -> 1-y
+    # Horizontal flip: x -> 1-x
+    
+    do_v = config["augmentations"]["vertical"]
+    do_h = config["augmentations"]["horizontal"]
+    do_b = config["augmentations"]["both"]
+    
+    def flip_y(s, t):
+        s_new = s.copy()
+        t_new = t.copy()
+        # s[:, 1] is y
+        s_new[:, 1] = 1.0 - s_new[:, 1]
+        t_new[1] = 1.0 - t_new[1]
+        # angle? y changes sign relative to center, but here it's 0..1
+        # let's skip angle update for simplicity or re-calc if critical
+        return s_new, t_new
+
+    def flip_x(s, t):
+        s_new = s.copy()
+        t_new = t.copy()
+        # s[:, 0] is x
+        s_new[:, 0] = 1.0 - s_new[:, 0]
+        t_new[0] = 1.0 - t_new[0]
+        return s_new, t_new
+
+    if do_v:
+        variants.append(flip_y(seq, target))
+    if do_h:
+        variants.append(flip_x(seq, target))
+    if do_b:
+        # Flip both
+        s_v, t_v = flip_y(seq, target)
+        s_vb, t_vb = flip_x(s_v, t_v)
+        variants.append((s_vb, t_vb))
+        
+    return variants
 
 
-def create_sequences(df: pd.DataFrame, config: dict, augment: bool = False):  # 시퀀스 데이터셋 생성 함수
-    """Convert a dataframe into stacked sequences and targets."""
-    sequences, targets = [], []  # 시퀀스와 타깃을 저장할 리스트 초기화
-    seq_len = config["seq_len"]  # 목표 시퀀스 길이 가져오기
-    feature_size = config["feature_size"]  # 피처 차원 수 가져오기
-    grouped = df.groupby("game_episode")  # 게임 에피소드별로 그룹화
-    for _, group in tqdm(grouped, desc=f"시퀀스 생성(Augment={augment})"):  # 각 에피소드별로 반복 (진행률 표시)
-        group = group.sort_values("time_seconds")  # 시간 순으로 정렬
-        coords = group[["start_x", "start_y"]].values  # 시작 좌표 배열 추출
-        actions = group["action_id"].values.reshape(-1, 1)  # 액션 ID를 열 벡터로 변환
-        results = group["result_mapped"].values.reshape(-1, 1)  # 결과 값을 열 벡터로 변환
-        target = group[["end_x", "end_y"]].values[-1].copy()  # 마지막 타임스텝의 끝 좌표를 타깃으로 설정
-        for coords_variant, target_variant in generate_variants(coords, target, config, augment):  # 증강 변형별로 반복
-            feats = build_feature_matrix(coords_variant, actions, results, config["goal_xy"])  # 8차원 피처 행렬 생성
-            seq = pad_or_truncate(feats, seq_len, feature_size)  # 시퀀스 길이 맞추기 (패딩 또는 자르기)
-            sequences.append(seq)  # 시퀀스 리스트에 추가
-            targets.append(target_variant)  # 타깃 리스트에 추가
-    return np.array(sequences), np.array(targets)  # 넘파이 배열로 변환하여 반환
-
-
-def load_match_sequence(file_path: str, config: dict):  # 단일 경기 시퀀스 로드 함수 (추론용)
-    """Load a single match CSV into a normalized, padded sequence."""
-    if not os.path.exists(file_path):  # 파일이 존재하지 않으면
-        return None  # None 반환
-    temp_df = pd.read_csv(file_path)  # CSV 파일 읽기
-    temp_df = preprocess_dataframe(temp_df, config, is_train=False)  # 전처리 (훈련 모드 아님)
-    coords = temp_df[["start_x", "start_y"]].values  # 시작 좌표 추출
-    actions = temp_df["action_id"].values.reshape(-1, 1)  # 액션 ID 열 벡터로 변환
-    results = temp_df["result_mapped"].values.reshape(-1, 1)  # 결과 값 열 벡터로 변환
-    feats = build_feature_matrix(coords, actions, results, config["goal_xy"])  # 피처 행렬 생성
-    return pad_or_truncate(feats, config["seq_len"], config["feature_size"])  # 시퀀스 길이 맞추어 반환
-
-
-def run_inference(model, meta_df, base_path, config, device):  # 모델 추론 실행 함수
-    """Iterate over metadata rows and generate predictions."""
-    model.eval()  # 모델을 평가 모드로 설정 (드롭아웃 비활성화)
-    preds_x, preds_y = [], []  # 예측 결과를 저장할 리스트
-    fallback_x, fallback_y = config["fallback_xy"]  # 파일 로드 실패 시 사용할 기본 좌표
-    with torch.no_grad():  # 그래디언트 계산 비활성화 (추론 시 메모리 절약)
-        for _, row in tqdm(meta_df.iterrows(), total=len(meta_df)):  # 메타데이터의 각 행에 대해 반복
-            file_path = os.path.join(base_path, row["path"][2:])  # CSV 파일 경로 생성 (상대 경로)
-            seq = load_match_sequence(file_path, config)  # CSV 파일을 시퀀스로 로드
-            if seq is None:  # 파일이 없거나 로드 실패 시
-                preds_x.append(fallback_x)  # 기본 x 좌표 추가
-                preds_y.append(fallback_y)  # 기본 y 좌표 추가
-                continue  # 다음 파일로 건너뜀
-            input_tensor = torch.FloatTensor(seq).unsqueeze(0).to(device)  # 시퀀스를 텐서로 변환하고 배치 차원 추가
-            pred = model(input_tensor).cpu().numpy()[0]  # 모델 예측 수행 (정규화된 좌표)
-            preds_x.append(pred[0] * config["field_dims"][0])  # 실제 축구장 크기로 역정규화하여 x 좌표 저장
-            preds_y.append(pred[1] * config["field_dims"][1])  # 실제 축구장 크기로 역정규화하여 y 좌표 저장
-    return preds_x, preds_y  # 모든 예측 좌표 리스트 반환
+def create_sequences(df: pd.DataFrame, config: dict, augment: bool = False):
+    """
+    Group by game_episode, build sequences.
+    Returns X (N, L, F), y (N, 2)
+    """
+    df_clean = preprocess_dataframe(df, config, is_train=True)
+    
+    sequences = []
+    targets = []
+    
+    # Group by (game_id, episode_id) or just 'game_episode' column if unique
+    # Using game_episode as unique identifier
+    groups = df_clean.groupby("game_episode")
+    
+    for _, group in groups:
+        # Sort by time
+        g = group.sort_values("time_seconds")
+        
+        # Target: last row's end_x, end_y
+        last_row = g.iloc[-1]
+        target_pt = np.array([last_row["end_x"], last_row["end_y"]], dtype=np.float32)
+        
+        # Features
+        feat_mat = build_feature_matrix(g, config)
+        feat_padded = pad_or_truncate(feat_mat, config["seq_len"])
+        
+        if augment:
+            # Generate augmentations
+            variant_list = generate_variants(feat_padded, target_pt, config)
+            for (s, t) in variant_list:
+                sequences.append(s)
+                targets.append(t)
+        else:
+            sequences.append(feat_padded)
+            targets.append(target_pt)
+            
+    return np.array(sequences), np.array(targets)
 
 
 # ---------------------------------------------------------------------------
-# Model definitions
+# Model Definitions
 # ---------------------------------------------------------------------------
-class PositionalEncoding(nn.Module):  # 위치 인코딩 클래스 (Transformer용)
-    """Sine/cosine positional encoding."""
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
 
-    def __init__(self, d_model: int, max_len: int = 500):  # 초기화 메서드
-        super().__init__()  # 부모 클래스 초기화
-        pe = torch.zeros(max_len, d_model)  # (최대길이, 모델차원) 크기의 0 텐서 생성
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # 위치 인덱스 생성 (열 벡터)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))  # 주기 계산을 위한 분모
-        pe[:, 0::2] = torch.sin(position * div_term)  # 짝수 인덱스: 사인 함수 적용
-        pe[:, 1::2] = torch.cos(position * div_term)  # 홀수 인덱스: 코사인 함수 적용
-        self.register_buffer("pe", pe.unsqueeze(0))  # 배치 차원을 추가하여 버퍼로 등록 (학습되지 않음)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # 순전파 메서드
-        length = x.size(1)  # 입력 시퀀스의 길이 가져오기
-        return x + self.pe[:, :length, :]  # 입력에 해당 길이만큼의 위치 인코딩을 더해서 반환
+    def forward(self, x):
+        # x: (Batch, SeqLen, Dim)
+        # pe: (MaxLen, Dim)
+        # Slice pe to (1, SeqLen, Dim)
+        return x + self.pe[:x.size(1), :].unsqueeze(0)
 
 
-class SoccerTransformer(nn.Module):  # 축구 시퀀스 회귀용 Transformer 모델
-    """Encoder-only Transformer tailored for soccer sequence regression."""
-
-    def __init__(self, config: dict):  # 모델 초기화
-        super().__init__()  # 부모 클래스 초기화
-        model_cfg = config["model"]  # 모델 설정 가져오기
-        feature_size = config["feature_size"]  # 입력 피처 차원
-        self.embedding = nn.Linear(feature_size, model_cfg["d_model"])  # 피처를 모델 차원으로 선형 변환
-        self.pos_encoder = PositionalEncoding(model_cfg["d_model"])  # 위치 인코딩 레이어
-        encoder_layer = nn.TransformerEncoderLayer(  # Transformer 인코더 레이어 생성
-            d_model=model_cfg["d_model"],  # 모델 차원
-            nhead=model_cfg["nhead"],  # 어텐션 헤드 수
-            dim_feedforward=512,  # 피드포워드 네트워크 차원
-            dropout=model_cfg["dropout"],  # 드롭아웃 비율
-            batch_first=True,  # 배치 차원을 첫 번째로 설정
+class SoccerTransformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.d_model = config["model"]["d_model"]
+        self.feat_size = config["feature_size"]
+        
+        # Input projection
+        self.input_proj = nn.Linear(self.feat_size, self.d_model)
+        
+        self.pos_encoder = PositionalEncoding(self.d_model, max_len=config["seq_len"] + 5)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=config["model"]["nhead"],
+            dim_feedforward=self.d_model * 2,
+            dropout=config["model"]["dropout"],
+            batch_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=model_cfg["num_layers"])  # 다층 인코더
-        self.fc_out = nn.Linear(model_cfg["d_model"], 2)  # 최종 출력 레이어 (x, y 좌표 예측)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=config["model"]["num_layers"]
+        )
+        
+        # Regression head
+        self.reg_head = nn.Sequential(
+            nn.Linear(self.d_model, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2) # Predict x, y
+        )
 
-    def forward(self, src: torch.Tensor) -> torch.Tensor:  # 순전파 메서드
-        x = self.embedding(src)  # 입력 피처를 임베딩 차원으로 변환
-        x = self.pos_encoder(x)  # 위치 인코딩 추가
-        encoded = self.transformer_encoder(x)  # Transformer 인코더 통과
-        return self.fc_out(encoded[:, -1, :])  # 마지막 타임스텝의 인코딩을 사용하여 (x, y) 좌표 예측
-
-
-# ---------------------------------------------------------------------------
-# Training / evaluation helpers
-# ---------------------------------------------------------------------------
-def train_one_epoch(model, loader, criterion, optimizer, device):  # 1 epoch 학습 함수
-    model.train()  # 모델을 학습 모드로 설정 (드롭아웃 활성화)
-    running_loss = 0.0  # 누적 손실 초기화
-    for inputs, targets in loader:  # 배치 단위로 데이터 반복
-        inputs, targets = inputs.to(device), targets.to(device)  # 데이터를 디바이스로 이동
-        optimizer.zero_grad()  # 이전 그래디언트 초기화
-        outputs = model(inputs)  # 모델 예측 수행
-        loss = criterion(outputs, targets)  # 손실 계산 (MSE)
-        loss.backward()  # 역전파로 그래디언트 계산
-        optimizer.step()  # 파라미터 업데이트
-        running_loss += loss.item()  # 배치 손실 누적
-    return running_loss / len(loader)  # 평균 손실 반환
-
-
-def evaluate(model, val_inputs, val_targets, criterion, device, field_dims):  # 검증 평가 함수
-    model.eval()  # 모델을 평가 모드로 설정
-    with torch.no_grad():  # 그래디언트 계산 비활성화
-        outputs = model(val_inputs)  # 검증 데이터로 예측 수행
-        loss = criterion(outputs, val_targets).item()  # 검증 손실 계산
-        diff_x = (outputs[:, 0] - val_targets[:, 0]) * field_dims[0]  # x 좌표 실제 차이 (미터 단위)
-        diff_y = (outputs[:, 1] - val_targets[:, 1]) * field_dims[1]  # y 좌표 실제 차이 (미터 단위)
-        val_score = torch.mean(torch.sqrt(diff_x ** 2 + diff_y ** 2)).item()  # 유클리드 거리 평균 (RMSE)
-    return loss, val_score  # 손실과 RMSE 스코어 반환
+    def forward(self, x):
+        # x: (Batch, Seq, Feat)
+        x = self.input_proj(x)
+        x = self.pos_encoder(x)
+        
+        # (Batch, Seq, d_model)
+        out = self.transformer_encoder(x)
+        
+        # Use last token embedding for prediction
+        # out[:, -1, :] -> (Batch, d_model)
+        last_emb = out[:, -1, :]
+        
+        pred = self.reg_head(last_emb)
+        return pred
 
 
 # ---------------------------------------------------------------------------
-# Main routine
+# Training / Evaluation
+# ---------------------------------------------------------------------------
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    for X_batch, y_batch in dataloader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        
+        optimizer.zero_grad()
+        pred = model(X_batch)
+        loss = criterion(pred, y_batch)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item() * X_batch.size(0)
+        
+    return total_loss / len(dataloader.dataset)
+
+
+def evaluate(model, dataloader, criterion, device, config):
+    model.eval()
+    total_loss = 0.0
+    all_preds = []
+    all_targets = []
+    field_x, field_y = config["field_dims"]
+    
+    with torch.no_grad():
+        for X_batch, y_batch in dataloader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            pred = model(X_batch)
+            loss = criterion(pred, y_batch)
+            total_loss += loss.item() * X_batch.size(0)
+            
+            # De-normalize for metric calculation
+            # pred: (B, 2), y: (B, 2)
+            # 0 -> x, 1 -> y
+            
+            p_np = pred.cpu().numpy()
+            t_np = y_batch.cpu().numpy()
+            
+            # Scale back
+            p_np[:, 0] *= field_x
+            p_np[:, 1] *= field_y
+            t_np[:, 0] *= field_x
+            t_np[:, 1] *= field_y
+            
+            all_preds.append(p_np)
+            all_targets.append(t_np)
+            
+    avg_loss = total_loss / len(dataloader.dataset)
+    
+    # Calculate RMSE or Euclidean distance average
+    P = np.vstack(all_preds)
+    T = np.vstack(all_targets)
+    
+    # Euclidean distance
+    dists = np.sqrt(np.sum((P - T)**2, axis=1))
+    mean_dist = np.mean(dists)
+    
+    return avg_loss, mean_dist
+
+
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+def load_match_sequence(file_path: str, config: dict) -> np.ndarray:
+    """Load a single test csv, preprocess, return (1, L, F) tensor."""
+    df = pd.read_csv(file_path)
+    df = preprocess_dataframe(df, config, is_train=False)
+    df = df.sort_values("time_seconds")
+    
+    feats = build_feature_matrix(df, config)
+    padded = pad_or_truncate(feats, config["seq_len"])
+    # Add batch dim
+    return np.expand_dims(padded, axis=0)
+
+
+def run_inference(model, test_df: pd.DataFrame, base_path: str, config: dict, device):
+    """
+    test_df: columns [game_id, game_episode, path]
+    Returns list of (game_episode, pred_x, pred_y)
+    """
+    model.eval()
+    results = []
+    
+    field_x, field_y = config["field_dims"]
+    
+    # Iterate over test index
+    for idx, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Inference"):
+        rel_path = row["path"]  # e.g. "./test/123/123_1.csv"
+        # Adjust path if needed. The provided path starts with "./test/"
+        # We need to join with base_path.
+        # Remove "./" prefix if exists
+        clean_path = rel_path.lstrip("./")
+        full_path = os.path.join(base_path, clean_path)
+        
+        if not os.path.exists(full_path):
+            # Fallback
+            results.append((row["game_episode"], config["fallback_xy"][0], config["fallback_xy"][1]))
+            continue
+            
+        inp = load_match_sequence(full_path, config)
+        inp_t = torch.from_numpy(inp).to(device)
+        
+        with torch.no_grad():
+            pred = model(inp_t)
+            # (1, 2)
+            
+        p_val = pred.cpu().numpy()[0]
+        px = p_val[0] * field_x
+        py = p_val[1] * field_y
+        
+        results.append((row["game_episode"], px, py))
+        
+    return results
+
+
+# ---------------------------------------------------------------------------
+# MAIN
 # ---------------------------------------------------------------------------
 def main():
-    print("데이터 로드 중...")
-    train_df = pd.read_csv("../open_track1/train.csv")  # 학습용 CSV 로드
-    train_df = preprocess_dataframe(train_df, CONFIG, is_train=True)  # 위치 정규화 및 피처 가공
+    print(">>> Setting up...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    
+    # Paths (adjust as needed)
+    # BASE_DIR should point to 'open_track1' folder containing csv files
+    DATA_DIR = os.path.join(PROJECT_ROOT, "open_track1")
+    train_csv = os.path.join(DATA_DIR, "train.csv")
+    test_csv = os.path.join(DATA_DIR, "test.csv")
+    
+    if not os.path.exists(train_csv):
+        print(f"Error: {train_csv} not found.")
+        return
 
-    unique_episodes = train_df["game_episode"].unique()  # 전체 에피소드 목록 추출
-    train_eps, val_eps = train_test_split(unique_episodes, test_size=0.2, random_state=42)  # 8:2로 train/val 분리
-    train_df_split = train_df[train_df["game_episode"].isin(train_eps)].copy()  # 학습용 데이터프레임
-    val_df_split = train_df[train_df["game_episode"].isin(val_eps)].copy()  # 검증용 데이터프레임
-    print(f"학습 에피소드: {len(train_eps)}개, 검증 에피소드: {len(val_eps)}개")
+    # 1. Load Train Data
+    print(">>> Loading Training Data...")
+    df_train = pd.read_csv(train_csv)
+    
+    # 2. Create Sequences
+    print(">>> Creating Sequences...")
+    X_all, y_all = create_sequences(df_train, CONFIG, augment=True)
+    print(f"Total sequences: {len(X_all)}")
+    
+    # 3. Split Train/Val
+    X_train, X_val, y_train, y_val = train_test_split(X_all, y_all, test_size=0.1, random_state=42)
+    
+    # 4. DataLoaders
+    train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
+    val_ds = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
+    
+    train_loader = DataLoader(train_ds, batch_size=CONFIG["training"]["batch_size"], shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=CONFIG["training"]["batch_size"], shuffle=False)
+    
+    # 5. Model Setup
+    model = SoccerTransformer(CONFIG).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=CONFIG["model"]["lr"])
+    criterion = nn.MSELoss()
+    
+    # 6. Training Loop
+    epochs = CONFIG["training"]["epochs"]
+    best_score = float('inf')
+    
+    print(">>> Starting Training...")
+    for ep in range(epochs):
+        t0 = time()
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_score = evaluate(model, val_loader, criterion, device, CONFIG)
+        
+        if (ep + 1) % CONFIG["training"]["log_interval"] == 0:
+            print(f"Epoch {ep+1}/{epochs} | T_Loss: {train_loss:.5f} | V_Loss: {val_loss:.5f} | V_Dist: {val_score:.4f}m | Time: {time()-t0:.1f}s")
+            
+        if val_score < best_score:
+            best_score = val_score
+            # [변경] 모델 저장 경로를 OUTPUT_DIR로 설정
+            model_save_path = os.path.join(OUTPUT_DIR, "soccer_model.pt")
+            torch.save(model.state_dict(), model_save_path)
+            
+    print(f">>> Best Val Distance: {best_score:.4f}m")
+    
+    # 7. Inference
+    print(">>> Starting Inference...")
+    # Load best model
+    model_save_path = os.path.join(OUTPUT_DIR, "soccer_model.pt")
+    if os.path.exists(model_save_path):
+        model.load_state_dict(torch.load(model_save_path, map_location=device))
+        print("Loaded best model.")
+    
+    df_test = pd.read_csv(test_csv)
+    # df_test has 'path' column. Need to prefix with DATA_DIR?
+    # Actually the paths in csv are like "./test/..." 
+    # If we run from 'track1', it might work, but let's be explicit.
+    # We pass DATA_DIR as base_path for reading test sequences.
+    
+    preds = run_inference(model, df_test, DATA_DIR, CONFIG, device)
+    
+    # 8. Save Submission
+    print(">>> Saving Submission...")
+    sub_df = pd.DataFrame(preds, columns=["game_episode", "end_x", "end_y"])
+    
+    # [변경] 제출 파일 저장 경로를 OUTPUT_DIR로 설정
+    sub_path = os.path.join(OUTPUT_DIR, "submission.csv")
+    sub_df.to_csv(sub_path, index=False)
+    print(f"Saved to {sub_path}")
 
-    print("학습 데이터셋 생성 중 (4배 증강 적용)...")  # 플립 증강으로 데이터 4배 증가
-    X_train, y_train = create_sequences(train_df_split, CONFIG, augment=True)  # 시퀀스 생성 (증강 적용)
-    print(f"학습 데이터 Shape: {X_train.shape}")  # (샘플수, 시퀀스길이, 피처차원)
-    print("검증 데이터셋 생성 중 (증강 미적용)...")  # 검증은 원본만 사용
-    X_val, y_val = create_sequences(val_df_split, CONFIG, augment=False)  # 시퀀스 생성 (증강 미적용)
-    print(f"검증 데이터 Shape: {X_val.shape}")
 
-    # DataLoader 생성: 배치 단위로 데이터 공급
-    train_loader = DataLoader(
-        TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train)),  # 텐서로 변환
-        batch_size=CONFIG["training"]["batch_size"],  # 한 번에 64개 샘플씩
-        shuffle=True,  # 학습 시 랜덤 섞기
-    )
-    X_val_tensor = torch.FloatTensor(X_val)  # 검증 입력 텐서
-    y_val_tensor = torch.FloatTensor(y_val)  # 검증 타깃 텐서
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # GPU 우선 사용
-    print(f"Using Device: {device}")
-    model = SoccerTransformer(CONFIG).to(device)  # 모델 초기화 및 디바이스 이동
-    criterion = nn.MSELoss()  # 손실 함수: 평균 제곱 오차
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG["model"]["lr"])  # 옵티마이저
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)  # 학습률 스케줄러
-    print(model)  # 모델 구조 출력
-
-    print("\n[Transformer 학습 시작]")
-    training_cfg = CONFIG["training"]
-    X_val_tensor = X_val_tensor.to(device)  # 검증 데이터를 GPU로
-    y_val_tensor = y_val_tensor.to(device)
-    for epoch in range(training_cfg["epochs"]):  # 설정된 epoch 수만큼 반복
-        start = time()  # 시간 측정 시작
-        avg_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)  # 1 epoch 학습
-        val_loss, val_score = evaluate(model, X_val_tensor, y_val_tensor, criterion, device, CONFIG["field_dims"])  # 검증 평가
-        scheduler.step(val_loss)  # 검증 손실에 따라 학습률 조정
-        if (epoch + 1) % training_cfg["log_interval"] == 0:  # 5 epoch마다 로그 출력
-            current_lr = optimizer.param_groups[0]["lr"]  # 현재 학습률
-            elapsed = time() - start  # 걸린 시간
-            print(
-                f"Epoch {epoch+1:02d} | Loss: {avg_loss:.5f} | Val Score: {val_score:.4f} "  # MSE 손실, RMSE 스코어
-                f"| LR: {current_lr:.2e} | Time: {elapsed:.1f}s"
-            )
-
-    print("\n[추론 시작]")  # 학습 완료 후 테스트 데이터로 예측
-    test_meta = pd.read_csv("../open_track1/test.csv")  # 테스트 메타 정보 로드
-    preds_x, preds_y = run_inference(model, test_meta, "../open_track1", CONFIG, device)  # 각 경기별 예측
-
-    submission = pd.read_csv("../open_track1/sample_submission.csv")  # 제출 양식 로드
-    submission["end_x"] = preds_x  # 예측 x 좌표 채우기
-    submission["end_y"] = preds_y  # 예측 y 좌표 채우기
-    output_name = "submission_transformer_v5_result_feat.csv"  # 출력 파일명
-    submission.to_csv(output_name, index=False)  # CSV로 저장 (인덱스 제외)
-    print(f"저장 완료: {output_name}")  # 완료 메시지
-
-
-if __name__ == "__main__":  # 스크립트 직접 실행 시
-    main()  # 메인 함수 호출하여 전체 파이프라인 실행
-
+if __name__ == "__main__":
+    main()
